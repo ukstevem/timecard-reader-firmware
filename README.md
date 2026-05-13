@@ -1,0 +1,113 @@
+# timecard-reader-firmware
+
+PSS card-reader firmware. Publishes RFID tap events to MQTT
+(`<site>/<stream>` topic, JSON payload), with on-device SD-card
+logging as a forensic backup.
+
+- **Current version:** `0.6.0` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
+- **Topic published:** `carrwood/timecard` (default; overridable per-device via SD config)
+- **Bridge consumer:** [ukstevem/timecard-bridge](https://github.com/ukstevem/timecard-bridge) — subscribes the same topic and writes to Supabase `timecard_events` via a durable SQLite outbox
+
+## Hardware
+
+- **M5Stack Core2** (ESP32, 320x240 IPS, SD slot, RTC, speaker)
+- **WS1850S RFID** (MFRC522 over I2C @ address `0x28`, on Core2 Port A: SDA=21, SCL=22)
+- **microSD card** holding `/timecard/config.ini` per-device config + `/timecard/YYYY-MM-DD.csv` daily tap logs
+
+## Required Arduino libraries
+
+- `M5Unified`
+- `PubSubClient`
+- `MFRC522_I2C`
+- `SD` (built-in)
+
+Board: `esp32:esp32:m5stack-core2` (config in `sketch.json`).
+
+## Build / upload
+
+Arduino IDE 2.x:
+
+1. Open `timecard_reader.ino`
+2. Copy `arduino_secrets.h.example` -> `arduino_secrets.h` and fill in WiFi/MQTT credentials (this file is gitignored — never commit credentials)
+3. Select board: M5Stack-Core2
+4. Upload
+
+## Per-device runtime config (SD card)
+
+Create `/timecard/config.ini` on the microSD card. Runtime values
+override the build-time defaults from `arduino_secrets.h`:
+
+```
+wifi_ssid=PSS_Office
+wifi_pass=your-wifi-password
+mqtt_host=10.0.0.180
+mqtt_port=1883
+mqtt_user=timecard
+mqtt_pass=letmein
+site=carrwood
+stream=timecard
+actor=timecard
+device_name=carr-tc-01
+```
+
+Only `site`, `stream`, `actor`, and `device_name` typically vary per
+device. Allowed values:
+- `site` ∈ {`carrwood`, `foxwood`}
+- `stream` ∈ {`timecard`, `jobcard`}
+- `actor` ∈ {`admin`, `test`, `harvester`, `timecard`}
+
+If `device_name` is empty, a MAC-derived id (`core2-XXXXYYYYYYYY`) is
+used.
+
+## Fleet (known devices)
+
+| device_name | site     | stream   | actor    |
+|-------------|----------|----------|----------|
+| `carr-tc-01`| carrwood | timecard | timecard |
+| `carr-tc-02`| carrwood | timecard | timecard |
+
+## SD-card logs
+
+Every tap is appended to `/timecard/YYYY-MM-DD.csv` regardless of
+MQTT state. 90-day rolling retention (`RETENTION_DAYS` in the sketch).
+Useful for recovery if a tap was lost between reader and Supabase.
+
+To recover taps from a card: pull the SD, copy the relevant
+`YYYY-MM-DD.csv`, replay rows via the `/hours` admin page (uses the
+`record_manual_taps` RPC).
+
+## MQTT payload shape
+
+```json
+{
+  "event": "tap",
+  "card_id": "A66A9500",
+  "device_id": "carr-tc-01",
+  "actor": "timecard",
+  "ts": "2026-05-13T04:55:29Z",
+  "firmware": "0.6.0"
+}
+```
+
+Topic is `<site>/<stream>` — e.g. `carrwood/timecard`. QoS 0,
+not-retained. Brokered by Mosquitto on `10.0.0.180:1883`.
+
+## LWT / birth
+
+On connect, the reader publishes `online` (retained) to
+`<topic>/status`. The MQTT Last-Will-and-Testament is `offline`
+(retained) on the same topic. Consumed by `mqtt-status-bridge`.
+
+## Related repos / docs
+
+- [ukstevem/timecard-bridge](https://github.com/ukstevem/timecard-bridge) — MQTT → Supabase ingestion bridge
+- [ukstevem/mqtt-status-bridge](https://github.com/ukstevem/mqtt-status-bridge) — device presence/heartbeats
+- [ukstevem/pss-employee-presence](https://github.com/ukstevem/pss-employee-presence) — Supabase schema (`timecard_events`, `employees`, RPCs) and the `/hours` admin UI for recovery
+
+## Known issues
+
+Tracked in [pss-employee-presence beads workspace](https://github.com/ukstevem/pss-employee-presence/blob/main/.beads/issues.jsonl), epic `pss-employee-presence-hc4`:
+
+- `hc4.4` — Add a pending-queue file + drain on MQTT reconnect (currently SD-logged but never republished)
+- `hc4.5` — Guard `publishAndLog` with `haveValidTime()` so taps before NTP sync don't get a 1999 timestamp
+- `hc4.7` — Move hardcoded WiFi/MQTT defaults out of `timecard_reader.ino` into `arduino_secrets.h`

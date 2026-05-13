@@ -1,0 +1,25 @@
+# Credentials — never commit
+arduino_secrets.h
+.env
+.env.*
+
+# Arduino IDE / PlatformIO build artifacts
+build/
+.pio/
+.pioenvs/
+.piolibdeps/
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.d
+
+# Editor / OS
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE workspace files
+*.code-workspace
