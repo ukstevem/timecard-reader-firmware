@@ -1,3 +1,10 @@
+// ============================================================
+// timecard-reader-firmware  v0.7.0
+// https://github.com/ukstevem/timecard-reader-firmware
+//
+// Keep this banner in sync with FIRMWARE_VERSION below.
+// ============================================================
+
 // ========= User settings =========
 const char* WIFI_SSID     = "PSS_Office";
 const char* WIFI_PASSWORD = "P550ffice$";
