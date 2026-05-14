@@ -11,7 +11,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.6.0";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.0";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -62,6 +62,13 @@ UiStatus    ui       = { false, false };
 #define LOG_DIR "/timecard"
 #define RETENTION_DAYS 90
 
+// Reader-side outbox: taps that mqtt.publish() did not accept land here
+// and are drained on MQTT reconnect (or periodically while pending).
+// Daily CSV (LOG_DIR/YYYY-MM-DD.csv) is the forensic record and is
+// unaffected by drain state.
+#define PENDING_PATH (LOG_DIR "/pending.jsonl")
+const uint32_t DRAIN_INTERVAL_MS = 30000;
+
 // Time formatting (UTC) for payload
 #define USE_ISO_TIME 1   // 1 => ISO 8601 UTC, 0 => epoch seconds
 
@@ -82,6 +89,10 @@ uint32_t lastUidMillis = 0;
 uint32_t lastReconnectAttempt = 0;
 String lastPurgeDate = "";  // "YYYY-MM-DD" last time we purged
 bool sdReady = false;
+
+// Pending-queue state — used by drainPending() in loop()
+bool prevMqttUp = false;
+uint32_t lastDrainMillis = 0;
 
 // Minimal-redraw cache for the clock
 String prevTimeRendered = "";
@@ -424,6 +435,87 @@ void purgeOldLogsIfNeeded(){
   lastPurgeDate = today;
 }
 
+// ---------- Pending-queue (reader-side outbox) ----------
+// Each line in PENDING_PATH is a complete JSON payload as published.
+// We append on publish failure and drain on reconnect.
+
+bool appendPending(const String& payload){
+  if (!sdReady) return false;
+  File f = SD.open(PENDING_PATH, FILE_APPEND);
+  if (!f) {
+    f = SD.open(PENDING_PATH, FILE_WRITE);
+    if (!f) return false;
+  }
+  f.println(payload);
+  f.close();
+  return true;
+}
+
+// Read pending.jsonl, try to publish each line, rewrite file with only
+// the ones that failed. Returns the count delivered this pass.
+// Notes:
+//  - whole file is loaded into RAM during the rewrite — fine for normal
+//    backlogs (a tap is ~160 bytes; 100 queued taps = ~16 KB)
+//  - if we lose MQTT mid-drain, the remaining lines stay queued
+//  - daily CSV is unaffected (forensic record)
+int drainPending(){
+  if (!sdReady) return 0;
+  if (!mqtt.connected()) return 0;
+  if (!SD.exists(PENDING_PATH)) return 0;
+
+  File r = SD.open(PENDING_PATH, FILE_READ);
+  if (!r) return 0;
+
+  String unsent;
+  unsent.reserve(2048);
+  int sent = 0, kept = 0;
+
+  while (r.available()){
+    String line = r.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+
+    bool ok = mqtt.connected() && mqtt.publish(
+      CFG_TOPIC.c_str(),
+      (const uint8_t*)line.c_str(),
+      (unsigned int)line.length(),
+      /*retain=*/false
+    );
+    if (ok) sent++;
+    else { unsent += line; unsent += '\n'; kept++; }
+  }
+  r.close();
+
+  // Rewrite atomically-ish: remove then write. If power cuts between
+  // the two, we lose ONLY the not-yet-rewritten lines — at worst the
+  // count of (sent + kept) taps lost this pass. The daily CSV still
+  // holds them as forensic evidence; bridge UNIQUE constraint protects
+  // against duplicates if we later re-replay manually.
+  SD.remove(PENDING_PATH);
+  if (unsent.length()){
+    File w = SD.open(PENDING_PATH, FILE_WRITE);
+    if (w){
+      w.print(unsent);
+      w.close();
+    }
+  }
+
+  if (sent || kept){
+    Serial.printf("drainPending: sent=%d kept=%d\n", sent, kept);
+  }
+  return sent;
+}
+
+bool pendingHasContent(){
+  if (!sdReady) return false;
+  if (!SD.exists(PENDING_PATH)) return false;
+  File f = SD.open(PENDING_PATH, FILE_READ);
+  if (!f) return false;
+  bool any = (f.size() > 0);
+  f.close();
+  return any;
+}
+
 /* ------------ SD config loader (INI-style) ------------ */
 // key=value parser
 bool parseKV(const String& line, String& k, String& v) {
@@ -551,7 +643,7 @@ void publishAndLog(const String& isoTime, const String& uidHex){
       /*retain=*/false
     );
 
-        if (!pubOK) {
+    if (!pubOK) {
       connectMQTT(3000);
       if (mqtt.connected()){
         pubOK = mqtt.publish(
@@ -564,13 +656,22 @@ void publishAndLog(const String& isoTime, const String& uidHex){
     }
   }
 
-  // Log JSON to SD (one JSON object per line)
+  // Log JSON to SD (one JSON object per line) — forensic record, always
   bool sdOK = appendLineToSD(isoTime.substring(0,10), payload);
   purgeOldLogsIfNeeded();
 
-  // UI feedback (we count SD success as success; MQTT may be offline)
-  showScanBanner(sdOK, payload);
-  if (sdOK) beepOK(); else beepFail();
+  // Reader-side outbox: if MQTT couldn't accept the publish, queue for
+  // drainPending() to retry when MQTT comes back.
+  bool queued = false;
+  if (!pubOK) {
+    queued = appendPending(payload);
+  }
+
+  // UI feedback: green if MQTT delivered OR safely queued; red only if
+  // we lost the tap entirely (no MQTT + no SD).
+  bool delivered = pubOK || queued;
+  showScanBanner(delivered, payload);
+  if (delivered) beepOK(); else beepFail();
 }
 
 
@@ -649,6 +750,18 @@ void loop(){
       connectMQTT(4000);  // attempt; ui.mqttOK will flip to true on next loop if it succeeds
     }
   }
+
+  // Drain pending-queue on MQTT reconnect (false -> true edge) or
+  // periodically while pending has content. Bounded work per tick so
+  // RFID polling stays responsive.
+  bool mqttUpNow = ui.mqttOK;
+  bool justCameUp = mqttUpNow && !prevMqttUp;
+  bool overdue = mqttUpNow && (millis() - lastDrainMillis > DRAIN_INTERVAL_MS);
+  if (justCameUp || (overdue && pendingHasContent())) {
+    drainPending();
+    lastDrainMillis = millis();
+  }
+  prevMqttUp = mqttUpNow;
 
   // UI tick (1 Hz)
   if (millis() - lastUITick >= 1000){

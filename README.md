@@ -4,7 +4,7 @@ PSS card-reader firmware. Publishes RFID tap events to MQTT
 (`<site>/<stream>` topic, JSON payload), with on-device SD-card
 logging as a forensic backup.
 
-- **Current version:** `0.6.0` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
+- **Current version:** `0.7.0` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
 - **Topic published:** `carrwood/timecard` (default; overridable per-device via SD config)
 - **Bridge consumer:** [ukstevem/timecard-bridge](https://github.com/ukstevem/timecard-bridge) — subscribes the same topic and writes to Supabase `timecard_events` via a durable SQLite outbox
 
@@ -70,11 +70,26 @@ used.
 
 Every tap is appended to `/timecard/YYYY-MM-DD.csv` regardless of
 MQTT state. 90-day rolling retention (`RETENTION_DAYS` in the sketch).
-Useful for recovery if a tap was lost between reader and Supabase.
+Forensic record — used for recovery if a tap was lost between reader
+and Supabase.
 
 To recover taps from a card: pull the SD, copy the relevant
 `YYYY-MM-DD.csv`, replay rows via the `/hours` admin page (uses the
 `record_manual_taps` RPC).
+
+## Reader-side outbox (since v0.7.0)
+
+Taps that `mqtt.publish()` does not accept (broker down, WiFi gone)
+are appended to `/timecard/pending.jsonl` instead of being lost. On
+MQTT reconnect — or every 30s while pending has content — the reader
+drains the queue back through MQTT in arrival order. The bridge's
+`UNIQUE(card_id, device_id, ts)` constraint (migration 023) makes
+re-delivery idempotent, so a tap delivered twice during weird race
+conditions still lands as a single row in Supabase.
+
+Default backoff: drain attempted every 30s (`DRAIN_INTERVAL_MS`).
+Whole pending file is loaded into RAM during the rewrite — fine for
+backlogs up to ~1000 queued taps (~160 KB).
 
 ## MQTT payload shape
 
@@ -108,6 +123,5 @@ On connect, the reader publishes `online` (retained) to
 
 Tracked in [pss-employee-presence beads workspace](https://github.com/ukstevem/pss-employee-presence/blob/main/.beads/issues.jsonl), epic `pss-employee-presence-hc4`:
 
-- `hc4.4` — Add a pending-queue file + drain on MQTT reconnect (currently SD-logged but never republished)
 - `hc4.5` — Guard `publishAndLog` with `haveValidTime()` so taps before NTP sync don't get a 1999 timestamp
 - `hc4.7` — Move hardcoded WiFi/MQTT defaults out of `timecard_reader.ino` into `arduino_secrets.h`
