@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.0
+// timecard-reader-firmware  v0.7.1
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -18,7 +18,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.0";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.1";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -677,7 +677,21 @@ void publishAndLog(const String& isoTime, const String& uidHex){
   // UI feedback: green if MQTT delivered OR safely queued; red only if
   // we lost the tap entirely (no MQTT + no SD).
   bool delivered = pubOK || queued;
-  showScanBanner(delivered, payload);
+
+  // Concise human-friendly banner: status + local HH:MM
+  char hhmm[6] = "--:--";
+  if (haveValidTime()){
+    time_t nowT = time(nullptr);
+    struct tm lt;
+    localtime_r(&nowT, &lt);
+    strftime(hhmm, sizeof(hhmm), "%H:%M", &lt);
+  }
+  String friendly;
+  if      (pubOK)  friendly = String("Sent  ") + hhmm;
+  else if (queued) friendly = String("Saved offline  ") + hhmm;
+  else             friendly = String("FAILED  ") + hhmm;
+
+  showScanBanner(delivered, friendly);
   if (delivered) beepOK(); else beepFail();
 }
 
