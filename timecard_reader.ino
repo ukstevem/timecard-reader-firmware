@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.1
+// timecard-reader-firmware  v0.7.2
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -18,7 +18,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.1";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.2";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -100,6 +100,9 @@ bool sdReady = false;
 // Pending-queue state — used by drainPending() in loop()
 bool prevMqttUp = false;
 uint32_t lastDrainMillis = 0;
+
+// Speaker volume for beep cues (M5Unified Speaker, 0..255)
+const uint8_t SPEAKER_VOLUME = 220;
 
 // Minimal-redraw cache for the clock
 String prevTimeRendered = "";
@@ -705,6 +708,7 @@ const uint32_t BANNER_MS = 2000;
 void setup(){
   auto cfg = M5.config();
   M5.begin(cfg);
+  M5.Speaker.setVolume(SPEAKER_VOLUME);
   M5.Display.setColorDepth(24);
   M5.Display.setTextWrap(false);
 
