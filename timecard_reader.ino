@@ -1,24 +1,30 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.2
+// timecard-reader-firmware  v0.7.3
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
+//
+// REQUIRES: arduino_secrets.h next to this sketch (gitignored).
+// Copy arduino_secrets.h.example -> arduino_secrets.h and fill in
+// real WiFi / MQTT credentials before compiling.
 // ============================================================
 
-// ========= User settings =========
-const char* WIFI_SSID     = "PSS_Office";
-const char* WIFI_PASSWORD = "P550ffice$";
+#include "arduino_secrets.h"
+
+// ========= User settings (defaults; runtime SD config.ini wins) =========
+const char* WIFI_SSID     = SECRET_WIFI_SSID;
+const char* WIFI_PASSWORD = SECRET_WIFI_PASS;
 
 const char* MQTT_HOST     = "10.0.0.180";
 const uint16_t MQTT_PORT  = 1883;
-const char* MQTT_USER     = "timecard";
-const char* MQTT_PASS     = "letmein";
+const char* MQTT_USER     = SECRET_MQTT_USER;
+const char* MQTT_PASS     = SECRET_MQTT_PASS;
 
 const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.2";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.3";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -102,7 +108,7 @@ bool prevMqttUp = false;
 uint32_t lastDrainMillis = 0;
 
 // Speaker volume for beep cues (M5Unified Speaker, 0..255)
-const uint8_t SPEAKER_VOLUME = 220;
+const uint8_t SPEAKER_VOLUME = 255;
 
 // Minimal-redraw cache for the clock
 String prevTimeRendered = "";
@@ -634,6 +640,16 @@ bool connectMQTT(uint32_t timeout_ms=10000){
 
 // ---------- Publish & Log (JSON) ----------
 void publishAndLog(const String& isoTime, const String& uidHex){
+  // NTP guard: refuse to publish before clock sync to avoid the 1999
+  // timestamp bug (haveValidTime() returns true only after 2021-01-01).
+  // Tap is dropped here rather than written to SD/pending with a junk
+  // ts — staff should re-tap once the clock placeholder clears.
+  if (!haveValidTime()) {
+    showScanBanner(false, "Clock not set — retry");
+    beepFail();
+    return;
+  }
+
   // JSON payload the bridge expects
   String payload;
   payload.reserve(160);
