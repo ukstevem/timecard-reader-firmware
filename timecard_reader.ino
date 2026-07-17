@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.6
+// timecard-reader-firmware  v0.7.7
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -24,7 +24,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.6";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.7";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -654,7 +654,15 @@ bool connectWiFi(uint32_t timeout_ms=15000){
   return (WiFi.status()==WL_CONNECTED);
 }
 
-bool connectMQTT(uint32_t timeout_ms=10000){
+// ONE connection attempt. Returns true if connected.
+//
+// Deliberately does NOT retry or delay() internally. loop() owns the retry
+// cadence. A blocking retry loop here starves the RFID poll: mqtt.connect()
+// can itself block for setSocketTimeout() on a dead broker, so looping over it
+// pinned the main loop for 4-6s out of every 5s whenever MQTT was down. Staff
+// tapped, nothing read the card, and the SD outbox never saw the tap either --
+// the outbox only helps for taps we actually manage to READ.
+bool connectMQTTOnce(){
   if (WiFi.status()!=WL_CONNECTED) return false;
 
   mqtt.setServer(CFG_MQTT_HOST.c_str(), CFG_MQTT_PORT);
@@ -663,29 +671,31 @@ bool connectMQTT(uint32_t timeout_ms=10000){
 
   // Last Will & Testament (retained "offline")
   const String willTopic = CFG_TOPIC + "/status";
-  const char*  willMsg   = "offline";
-  const uint8_t willQos  = 1;
-  const bool    willRetain = true;
+  String cid = String(DEVICE_ID);
 
+  bool ok = mqtt.connect(
+    cid.c_str(),
+    CFG_MQTT_USER.c_str(),
+    CFG_MQTT_PASS.c_str(),
+    willTopic.c_str(),
+    /*willQos=*/1,
+    /*willRetain=*/true,
+    "offline"
+  );
+
+  if (ok) {
+    // Birth message: retained "online"
+    mqtt.publish(willTopic.c_str(), "online", /*retain=*/true);
+  }
+  return ok;
+}
+
+// Blocking connect with retries. Only for setup(), where there is no RFID
+// polling to starve yet. Do NOT call this from loop().
+bool connectMQTT(uint32_t timeout_ms=10000){
   const uint32_t start = millis();
   while (!mqtt.connected() && (millis() - start) < timeout_ms) {
-    String cid = String(DEVICE_ID);
-    bool ok = mqtt.connect(
-      cid.c_str(),
-      CFG_MQTT_USER.c_str(),
-      CFG_MQTT_PASS.c_str(),
-      willTopic.c_str(),
-      willQos,
-      willRetain,
-      willMsg
-    );
-    if (!ok) delay(1000);
-  }
-
-  if (mqtt.connected()) {
-    // Birth message: retained "online"
-    const char* online = "online";
-    mqtt.publish(willTopic.c_str(), online, /*retain=*/true);
+    if (!connectMQTTOnce()) delay(1000);
   }
   return mqtt.connected();
 }
@@ -724,7 +734,7 @@ void publishAndLog(const String& isoTime, const String& uidHex){
     );
 
     if (!pubOK) {
-      connectMQTT(3000);
+      connectMQTTOnce();   // one attempt; don't stall the tap path with retries
       if (mqtt.connected()){
         pubOK = mqtt.publish(
           CFG_TOPIC.c_str(),
@@ -828,22 +838,54 @@ void setup(){
 }
 
 
+// Poll the RFID reader; handle a tap if a card is present. Returns fast when
+// there is no card. Kept free of any network work so it can run every tick.
+void pollCard(){
+  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return;
+
+  String uidHex = toHex(mfrc522.uid.uidByte, mfrc522.uid.size);
+
+  // Debounce repeat scans
+  uint32_t nowMs = millis();
+  bool repeat = (uidHex == lastUid) && (nowMs - lastUidMillis < RESCAN_BLOCK_MS);
+  if (!repeat){
+    lastUid = uidHex; lastUidMillis = nowMs;
+
+    time_t now = time(nullptr);
+    String ts = USE_ISO_TIME ? iso8601_utc(now) : String((unsigned long)now);
+
+    publishAndLog(ts, uidHex);
+    bannerShownAt = millis();
+  }
+
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
 void loop(){
   M5.update();
 
   // Keep MQTT client serviced first, so .connected() is up to date
   mqtt.loop();
-  
+
   // Always reflect *current* states (no stale values)
   ui.wifiOK = (WiFi.status() == WL_CONNECTED);
   ui.mqttOK = mqtt.connected();
-  
-  // Try reconnect occasionally, but don't overwrite the UI flag here
+
+  // Read cards FIRST. A tap must never wait on the network: this used to sit at
+  // the bottom of loop(), behind a blocking reconnect, so during an MQTT outage
+  // the reader was only polled once every ~5s and staff taps went unread.
+  pollCard();
+
+  // Try reconnect occasionally, but don't overwrite the UI flag here.
+  // ONE attempt per tick (connectMQTTOnce, not connectMQTT): a single failed
+  // attempt can still block for the socket timeout, so the retry gap is timed
+  // from when the attempt RETURNS -- that guarantees a real window of
+  // responsive card polling between attempts rather than back-to-back stalls.
   if (ui.wifiOK && !ui.mqttOK) {
-    uint32_t now = millis();
-    if (now - lastReconnectAttempt > 5000) {
-      lastReconnectAttempt = now;
-      connectMQTT(4000);  // attempt; ui.mqttOK will flip to true on next loop if it succeeds
+    if (millis() - lastReconnectAttempt > 5000) {
+      connectMQTTOnce();
+      lastReconnectAttempt = millis();
     }
   }
 
@@ -871,28 +913,6 @@ void loop(){
     bannerShownAt = 0;
   }
 
-  // Card present?
-  if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()){
-    delay(20);
-    return;
-  }
-
-  String uidHex = toHex(mfrc522.uid.uidByte, mfrc522.uid.size);
-
-  // Debounce repeat scans
-  uint32_t nowMs = millis();
-  bool repeat = (uidHex == lastUid) && (nowMs - lastUidMillis < RESCAN_BLOCK_MS);
-  if (!repeat){
-    lastUid = uidHex; lastUidMillis = nowMs;
-
-    time_t now = time(nullptr);
-    String ts = USE_ISO_TIME ? iso8601_utc(now) : String((unsigned long)now);
-
-    publishAndLog(ts, uidHex);
-    bannerShownAt = millis();
-  }
-
-  mfrc522.PICC_HaltA();
-  mfrc522.PCD_StopCrypto1();
+  // Card polling now happens at the top of loop() via pollCard().
   delay(20);
 }
