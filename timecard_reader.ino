@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.7
+// timecard-reader-firmware  v0.7.8
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -24,7 +24,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.7";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.8";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -521,12 +521,54 @@ bool appendPending(const String& payload){
   return true;
 }
 
-// Read pending.jsonl, try to publish each line, rewrite file with only
-// the ones that failed. Returns the count delivered this pass.
+// ---------- Delivery confirmation (broker echo ACK) ----------
+// PubSubClient is QoS 0 only: publish() returns true once the payload reaches
+// the LOCAL TCP SOCKET, not when the broker has it. On a lossy link that lie
+// cost us taps — drainPending() used to delete lines it had never delivered,
+// and publishAndLog() skipped the outbox entirely on a "successful" publish.
+//
+// So prove delivery rather than assume it. The device subscribes to its own
+// publish topic; the broker echoes back every message it accepts. That echo is
+// end-to-end proof. Until it arrives the tap stays in the outbox and is
+// re-published on each drain. A lost echo only costs a duplicate, and the
+// bridge's UNIQUE(card_id, device_id, ts) makes duplicates free — so we bias
+// all the way toward re-sending. Everything eventually gets through.
+const uint8_t CONFIRMED_MAX = 64;
+uint32_t confirmedHashes[CONFIRMED_MAX];
+uint8_t  confirmedCount = 0;
+uint8_t  confirmedNext  = 0;
+
+uint32_t payloadHash(const uint8_t* data, unsigned int len){
+  uint32_t h = 2166136261UL;                 // FNV-1a
+  for (unsigned int i = 0; i < len; i++){ h ^= data[i]; h *= 16777619UL; }
+  return h;
+}
+uint32_t payloadHashStr(const String& s){
+  return payloadHash((const uint8_t*)s.c_str(), s.length());
+}
+bool isConfirmed(uint32_t h){
+  for (uint8_t i = 0; i < confirmedCount; i++) if (confirmedHashes[i] == h) return true;
+  return false;
+}
+void markConfirmed(uint32_t h){
+  if (isConfirmed(h)) return;
+  confirmedHashes[confirmedNext] = h;
+  confirmedNext = (confirmedNext + 1) % CONFIRMED_MAX;
+  if (confirmedCount < CONFIRMED_MAX) confirmedCount++;
+}
+
+// Echo from the broker on our own topic. The other reader's taps land here too
+// and simply never match a line in our outbox, so they're harmless.
+void onMqttMessage(char* topic, uint8_t* payload, unsigned int length){
+  markConfirmed(payloadHash(payload, length));
+}
+
+// Read pending.jsonl. Drop lines the broker has echoed back (proven delivered);
+// re-publish and KEEP everything else. Returns the count purged this pass.
 // Notes:
 //  - whole file is loaded into RAM during the rewrite — fine for normal
 //    backlogs (a tap is ~160 bytes; 100 queued taps = ~16 KB)
-//  - if we lose MQTT mid-drain, the remaining lines stay queued
+//  - a line is only ever removed on proof of delivery, never on publish()
 //  - daily CSV is unaffected (forensic record)
 int drainPending(){
   if (!sdReady) return 0;
@@ -538,21 +580,29 @@ int drainPending(){
 
   String unsent;
   unsent.reserve(2048);
-  int sent = 0, kept = 0;
+  int purged = 0, resent = 0;
 
   while (r.available()){
     String line = r.readStringUntil('\n');
     line.trim();
     if (!line.length()) continue;
 
-    bool ok = mqtt.connected() && mqtt.publish(
-      CFG_TOPIC.c_str(),
-      (const uint8_t*)line.c_str(),
-      (unsigned int)line.length(),
-      /*retain=*/false
-    );
-    if (ok) sent++;
-    else { unsent += line; unsent += '\n'; kept++; }
+    // Proven delivered — the broker echoed this exact payload back to us.
+    if (isConfirmed(payloadHashStr(line))) { purged++; continue; }
+
+    // Not proven. (Re)publish and KEEP the line regardless of what publish()
+    // claims: its return value only means "handed to the socket". The line
+    // survives until an echo proves the broker took it.
+    if (mqtt.connected()){
+      mqtt.publish(
+        CFG_TOPIC.c_str(),
+        (const uint8_t*)line.c_str(),
+        (unsigned int)line.length(),
+        /*retain=*/false
+      );
+      resent++;
+    }
+    unsent += line; unsent += '\n';
   }
   r.close();
 
@@ -570,10 +620,10 @@ int drainPending(){
     }
   }
 
-  if (sent || kept){
-    Serial.printf("drainPending: sent=%d kept=%d\n", sent, kept);
+  if (purged || resent){
+    Serial.printf("drainPending: purged=%d resent=%d\n", purged, resent);
   }
-  return sent;
+  return purged;
 }
 
 bool pendingHasContent(){
@@ -668,6 +718,7 @@ bool connectMQTTOnce(){
   mqtt.setServer(CFG_MQTT_HOST.c_str(), CFG_MQTT_PORT);
   mqtt.setKeepAlive(30);
   mqtt.setSocketTimeout(5);
+  mqtt.setCallback(onMqttMessage);   // broker echo = delivery proof
 
   // Last Will & Testament (retained "offline")
   const String willTopic = CFG_TOPIC + "/status";
@@ -686,6 +737,9 @@ bool connectMQTTOnce(){
   if (ok) {
     // Birth message: retained "online"
     mqtt.publish(willTopic.c_str(), "online", /*retain=*/true);
+    // Subscribe to our own publish topic: the broker echoes back what it
+    // accepts, which is how drainPending() proves a tap actually landed.
+    mqtt.subscribe(CFG_TOPIC.c_str());
   }
   return ok;
 }
@@ -750,12 +804,15 @@ void publishAndLog(const String& isoTime, const String& uidHex){
   bool sdOK = appendLineToSD(isoTime.substring(0,10), payload);
   purgeOldLogsIfNeeded();
 
-  // Reader-side outbox: if MQTT couldn't accept the publish, queue for
-  // drainPending() to retry when MQTT comes back.
-  bool queued = false;
-  if (!pubOK) {
-    queued = appendPending(payload);
-  }
+  // Reader-side outbox: queue EVERY tap, unconditionally.
+  //
+  // This used to be `if (!pubOK)`, which lost taps: pubOK comes from a QoS 0
+  // publish() that returns true once the payload hits the local socket, so a
+  // tap could report "sent", never reach the broker, and never be queued —
+  // gone, with only the daily CSV as evidence. pubOK is not proof and must
+  // never gate the outbox. drainPending() removes the line once the broker
+  // echoes it back; duplicates are absorbed by the bridge's uniqueness index.
+  bool queued = appendPending(payload);
 
   // UI feedback: green if MQTT delivered OR safely queued; red only if
   // we lost the tap entirely (no MQTT + no SD).
