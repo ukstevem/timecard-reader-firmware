@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.3
+// timecard-reader-firmware  v0.7.6
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -24,7 +24,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.3";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.6";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -110,6 +110,32 @@ uint32_t lastDrainMillis = 0;
 // Speaker volume for beep cues (M5Unified Speaker, 0..255)
 const uint8_t SPEAKER_VOLUME = 255;
 
+// ---------- External buzzer (M5 Unit Buzzer, U085) ----------
+// PASSIVE buzzer -> needs a PWM square wave on a GPIO. It CANNOT be driven
+// through the PaHUB2 (that mux only routes I2C SDA/SCL). Plug the Unit Buzzer
+// into Core2 PORT B (black); its yellow signal wire lands on GPIO 26.
+#define BUZZER_PIN            26     // Port B yellow. Use 13 if you wire it to Port C.
+#define BUZZER_PWM_FREQ_HZ    4000   // this unit is loudest around its 4 kHz resonance
+#define USE_INTERNAL_SPEAKER  1      // internal speaker is the LOUDEST source (bench-measured); it carries the cue
+#define SPK_LOUD_HZ           2700   // Core2 internal speaker's loudest band (measured louder than 4 kHz)
+
+// LEDC tone shim: pin-based on ESP32 Arduino core 3.x, channel-based on 2.x.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  inline void buzzerBegin(){ ledcAttach(BUZZER_PIN, BUZZER_PWM_FREQ_HZ, 10); ledcWriteTone(BUZZER_PIN, 0); }
+  inline void buzzerTone(uint16_t f){ ledcWriteTone(BUZZER_PIN, f); }
+  inline void buzzerOff(){ ledcWriteTone(BUZZER_PIN, 0); }
+#else
+  static const int BUZZER_LEDC_CH = 2;   // keep clear of LEDC channel 0
+  inline void buzzerBegin(){ ledcSetup(BUZZER_LEDC_CH, BUZZER_PWM_FREQ_HZ, 10); ledcAttachPin(BUZZER_PIN, BUZZER_LEDC_CH); ledcWriteTone(BUZZER_LEDC_CH, 0); }
+  inline void buzzerTone(uint16_t f){ ledcWriteTone(BUZZER_LEDC_CH, f); }
+  inline void buzzerOff(){ ledcWriteTone(BUZZER_LEDC_CH, 0); }
+#endif
+
+// The pass/fail cues are played inline in beepOK()/beepFail() below, as plain
+// buzzerTone()+delay() sequences. Deliberately NOT driven by an array-of-struct
+// helper: a user-defined type in a function signature trips the Arduino .ino
+// auto-prototype generator (it hoists the prototype above the type definition).
+
 // Minimal-redraw cache for the clock
 String prevTimeRendered = "";
 String prevDateRendered = "";
@@ -120,15 +146,43 @@ int prevDateW = 0, prevDateH = 0;
 int  lastClockMinute = -1;
 bool drewPlaceholder  = false;
 
-inline void beepOK(){
-  M5.Speaker.tone(1200, 70);
-  delay(30);
-  M5.Speaker.tone(1600, 90);
+// LOUDNESS (bench-measured 2026-07-14): the Core2's amplified INTERNAL speaker is
+// the loudest source, peaking near 2.7 kHz — louder than the external U085 buzzer,
+// which is ~72 dB and adds <1 dB as a second source. So each cue "note" drives the
+// internal speaker at SPK_LOUD_HZ AND pulses the external buzzer at its resonance in
+// parallel (uses the fitted part, localises the sound). Pass/fail differ by rhythm.
+
+// One cue note: internal speaker + external buzzer together, for ms.
+inline void cueOn(uint16_t ms){
+#if USE_INTERNAL_SPEAKER
+  M5.Speaker.tone(SPK_LOUD_HZ, ms);   // non-blocking; auto-stops after ms
+#endif
+  buzzerTone(BUZZER_PWM_FREQ_HZ);
+  delay(ms);
+  buzzerOff();
 }
+inline void cueGap(uint16_t ms){
+#if USE_INTERNAL_SPEAKER
+  M5.Speaker.stop();
+#endif
+  buzzerOff();
+  delay(ms);
+}
+
+// PASS: two short blips — "beep-beep".
+inline void beepOK(){
+  cueOn(90); cueGap(70); cueOn(90);
+#if USE_INTERNAL_SPEAKER
+  M5.Speaker.stop();
+#endif
+}
+// FAIL: three urgent blips + a long blast — "bip-bip-bip-beeeep".
 inline void beepFail(){
-  M5.Speaker.tone(220, 140);
-  delay(20);
-  M5.Speaker.tone(160, 180);
+  for (int i = 0; i < 3; i++){ cueOn(70); cueGap(50); }
+  cueOn(450);
+#if USE_INTERNAL_SPEAKER
+  M5.Speaker.stop();
+#endif
 }
 
 // ---------- NTP / Time ----------
@@ -725,6 +779,7 @@ void setup(){
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Speaker.setVolume(SPEAKER_VOLUME);
+  buzzerBegin();   // external M5 Unit Buzzer on Port B (GPIO 26)
   M5.Display.setColorDepth(24);
   M5.Display.setTextWrap(false);
 

@@ -4,7 +4,7 @@ PSS card-reader firmware. Publishes RFID tap events to MQTT
 (`<site>/<stream>` topic, JSON payload), with on-device SD-card
 logging as a forensic backup.
 
-- **Current version:** `0.7.0` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
+- **Current version:** `0.7.6` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
 - **Topic published:** `carrwood/timecard` (default; overridable per-device via SD config)
 - **Bridge consumer:** [ukstevem/timecard-bridge](https://github.com/ukstevem/timecard-bridge) — subscribes the same topic and writes to Supabase `timecard_events` via a durable SQLite outbox
 
@@ -13,6 +13,8 @@ logging as a forensic backup.
 - **M5Stack Core2** (ESP32, 320x240 IPS, SD slot, RTC, speaker)
 - **WS1850S RFID** (MFRC522 over I2C @ address `0x28`, on Core2 Port A: SDA=21, SCL=22)
 - **microSD card** holding `/timecard/config.ini` per-device config + `/timecard/YYYY-MM-DD.csv` daily tap logs
+- **Audible tap feedback** — the Core2's **internal speaker** is the loudest source (bench-measured peak ~2.7 kHz, `SPK_LOUD_HZ`) and carries the cue. An **M5 Unit Buzzer (U085)** on **Port B (GPIO 26)** pulses in parallel at its ~4 kHz resonance (`BUZZER_PWM_FREQ_HZ`) — it's only ~72 dB and adds <1 dB, but localises the sound at the reader. Pass = two blips, fail = three blips + long blast (`beepOK`/`beepFail`). Buzzer needs no library and **cannot** go on a PaHUB (I²C-only, no PWM). For a genuinely louder alert, fit an active piezo siren (85–100 dB) or an amplified speaker unit.
+- *(optional)* **PaHUB2** — I²C hub (PCA9548A @ `0x70`) if you ever need to hang more I²C units off Port A alongside the RFID reader. Downstream devices need a channel-select write before access.
 
 ## Required Arduino libraries
 
@@ -21,7 +23,9 @@ logging as a forensic backup.
 - `MFRC522_I2C`
 - `SD` (built-in)
 
-Board: `esp32:esp32:m5stack-core2` (config in `sketch.json`).
+Board: `esp32:esp32:m5stack_core2` (config in `sketch.json`). Note: ESP32
+Arduino core 3.x renamed the board id from the older hyphenated
+`m5stack-core2` — use the underscore form.
 
 ## Build / upload
 
@@ -31,6 +35,20 @@ Arduino IDE 2.x:
 2. Copy `arduino_secrets.h.example` -> `arduino_secrets.h` and fill in WiFi/MQTT credentials (this file is gitignored — never commit credentials)
 3. Select board: M5Stack-Core2
 4. Upload
+
+Headless (`arduino-cli`), e.g. the copy bundled with Arduino IDE 2.x
+(`.../Arduino IDE/resources/app/lib/backend/resources/arduino-cli.exe`):
+
+```sh
+# one-time: the sketch needs these two libs in your sketchbook
+arduino-cli lib install "PubSubClient" "MFRC522_I2C"
+
+# compile + flash (COMx = the CH9102F USB port of the Core2)
+arduino-cli compile --fqbn esp32:esp32:m5stack_core2 --upload -p COMx .
+```
+
+The **same binary flashes to every reader** — per-device identity comes
+from the SD `config.ini` at runtime, not the build.
 
 ## Per-device runtime config (SD card)
 
