@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.9
+// timecard-reader-firmware  v0.7.10
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -24,7 +24,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.9";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.10";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -111,6 +111,17 @@ bool sdReady = false;
 // Pending-queue state — used by drainPending() in loop()
 bool prevMqttUp = false;
 uint32_t lastDrainMillis = 0;
+
+// An echo proves a queued tap landed, but the line isn't removed until a drain
+// runs — so without this the header would sit amber at Q:1 for up to
+// DRAIN_INTERVAL_MS (30s) after every ordinary tap. A counter that is amber
+// half the time trains people to ignore it, which is how lost taps went
+// unnoticed for a fortnight. So an echo schedules a drain shortly after.
+// The short settle lets a burst of echoes land in ONE rewrite rather than one
+// rewrite per tap.
+const uint32_t ECHO_SETTLE_MS = 1500;
+bool     drainScheduled   = false;
+uint32_t drainScheduledAt = 0;
 
 // Speaker volume for beep cues (M5Unified Speaker, 0..255)
 const uint8_t SPEAKER_VOLUME = 255;
@@ -595,8 +606,19 @@ void markConfirmed(uint32_t h){
 
 // Echo from the broker on our own topic. The other reader's taps land here too
 // and simply never match a line in our outbox, so they're harmless.
+//
+// Called from mqtt.loop() on the main task — a plain flag is safe here, no ISR.
 void onMqttMessage(char* topic, uint8_t* payload, unsigned int length){
   markConfirmed(payloadHash(payload, length));
+
+  // Something we're holding may now be provable: drain shortly, so Q returns
+  // to 0 promptly instead of waiting out the 30s tick. Guarded on
+  // pendingCount so the other reader's traffic doesn't schedule pointless
+  // SD rewrites.
+  if (pendingCount > 0 && !drainScheduled){
+    drainScheduled   = true;
+    drainScheduledAt = millis();
+  }
 }
 
 // Read pending.jsonl. Drop lines the broker has echoed back (proven delivered);
@@ -995,9 +1017,14 @@ void loop(){
   bool mqttUpNow = ui.mqttOK;
   bool justCameUp = mqttUpNow && !prevMqttUp;
   bool overdue = mqttUpNow && (millis() - lastDrainMillis > DRAIN_INTERVAL_MS);
-  if (justCameUp || (overdue && pendingHasContent())) {
+  // An echo landed for something we hold — purge it promptly so Q:n reflects
+  // reality within a second or two rather than up to 30s later.
+  bool echoDue = mqttUpNow && drainScheduled
+                 && (millis() - drainScheduledAt > ECHO_SETTLE_MS);
+  if (justCameUp || echoDue || (overdue && pendingHasContent())) {
     drainPending();
     lastDrainMillis = millis();
+    drainScheduled  = false;
   }
   prevMqttUp = mqttUpNow;
 
