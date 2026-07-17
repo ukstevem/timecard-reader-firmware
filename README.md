@@ -4,7 +4,7 @@ PSS card-reader firmware. Publishes RFID tap events to MQTT
 (`<site>/<stream>` topic, JSON payload), with on-device SD-card
 logging as a forensic backup.
 
-- **Current version:** `0.7.8` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
+- **Current version:** `0.7.9` (see `FIRMWARE_VERSION` in `timecard_reader.ino`)
 - **Topic published:** `carrwood/timecard` (default; overridable per-device via SD config)
 - **Bridge consumer:** [ukstevem/timecard-bridge](https://github.com/ukstevem/timecard-bridge) — subscribes the same topic and writes to Supabase `timecard_events` via a durable SQLite outbox
 

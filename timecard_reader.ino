@@ -1,5 +1,5 @@
 // ============================================================
-// timecard-reader-firmware  v0.7.8
+// timecard-reader-firmware  v0.7.9
 // https://github.com/ukstevem/timecard-reader-firmware
 //
 // Keep this banner in sync with FIRMWARE_VERSION below.
@@ -24,7 +24,7 @@ const char* MQTT_TOPIC    = "carrwood/timecard";  // publishes "time,cardid"
 
 // ======== JSON meta ========
 const char* DEVICE_ACTOR      = "timecard";   // one of: admin, test, harvester, timecard
-const char* FIRMWARE_VERSION  = "0.7.8";      // bump as you release
+const char* FIRMWARE_VERSION  = "0.7.9";      // bump as you release
 
 // ===== Runtime-configurable (defaults from existing constants) =====
 String CFG_WIFI_SSID     = WIFI_SSID;
@@ -61,10 +61,15 @@ void loadConfigFromSD();
 
 // ---------- UI Types & State ----------
 struct UiStatus { bool wifiOK; bool mqttOK; };
-struct HeaderCache { bool wifi; bool mqtt; int sdPct; bool init; };
+struct HeaderCache { bool wifi; bool mqtt; int sdPct; int pending; bool init; };
 
-HeaderCache hdrCache = { false, false, -1, false };
+HeaderCache hdrCache = { false, false, -1, -1, false };
 UiStatus    ui       = { false, false };
+
+// Taps sitting in the outbox waiting on proof of delivery. Tracked in RAM so
+// the 1 Hz header redraw never has to read the SD card; kept in step by
+// appendPending() / drainPending(), and seeded from the file at boot.
+int pendingCount = 0;
 
 // --- RFID / I2C config ---
 #define RFID_I2C_ADDR 0x28
@@ -200,6 +205,7 @@ static const uint32_t COL_BG        = 0x000000; // black
 static const uint32_t COL_HEADER_BG = 0x303030; // dark grey
 static const uint32_t COL_OK        = 0x00FF00; // green
 static const uint32_t COL_BAD       = 0xFF0000; // red
+static const uint32_t COL_WARN      = 0xFFA000; // amber — queued taps waiting
 static const uint32_t COL_TEXT      = 0xFFFFFF; // white
 static const uint32_t COL_TIME      = 0xFFFFFF; // white
 static const uint32_t COL_DATE      = 0xFFFFFF; // white
@@ -281,10 +287,12 @@ void drawHeader(const UiStatus& s){
   int pct = sdPercentFree();
 
   // Only redraw when something changed
-  if (!hdrCache.init || hdrCache.wifi != s.wifiOK || hdrCache.mqtt != s.mqttOK || hdrCache.sdPct != pct){
+  if (!hdrCache.init || hdrCache.wifi != s.wifiOK || hdrCache.mqtt != s.mqttOK
+      || hdrCache.sdPct != pct || hdrCache.pending != pendingCount){
     hdrCache.wifi = s.wifiOK;
     hdrCache.mqtt = s.mqttOK;
     hdrCache.sdPct = pct;
+    hdrCache.pending = pendingCount;
     hdrCache.init = true;
 
     M5.Display.fillRect(0, 0, M5.Display.width(), HEADER_H, COL_HEADER_BG);
@@ -312,6 +320,16 @@ void drawHeader(const UiStatus& s){
     M5.Display.setCursor(x, 4);
     if (pct >= 0) M5.Display.printf("SD %d%% free", pct);
     else          M5.Display.print("SD n/a");
+
+    // Outbox depth, right-aligned: taps read but not yet proven delivered.
+    // Amber while anything is waiting, white at zero. Should sit at 0 on a
+    // healthy link and climb only while the broker is unreachable.
+    M5.Display.setTextDatum(TR_DATUM);
+    M5.Display.setTextColor(pendingCount > 0 ? COL_WARN : 0xFFFFFF, COL_HEADER_BG);
+    M5.Display.drawString(String("Q:") + String(pendingCount),
+                          M5.Display.width() - PADDING, 4);
+    M5.Display.setTextDatum(TL_DATUM);
+    M5.Display.setTextColor(0xFFFFFF, COL_HEADER_BG);
   }
 }
 
@@ -518,7 +536,25 @@ bool appendPending(const String& payload){
   }
   f.println(payload);
   f.close();
+  pendingCount++;             // header shows outbox depth
   return true;
+}
+
+// Count queued taps on disk. Only called at boot — after that the count is
+// maintained in RAM by appendPending()/drainPending().
+int countPendingLines(){
+  if (!sdReady) return 0;
+  if (!SD.exists(PENDING_PATH)) return 0;
+  File f = SD.open(PENDING_PATH, FILE_READ);
+  if (!f) return 0;
+  int n = 0;
+  while (f.available()){
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length()) n++;
+  }
+  f.close();
+  return n;
 }
 
 // ---------- Delivery confirmation (broker echo ACK) ----------
@@ -580,7 +616,7 @@ int drainPending(){
 
   String unsent;
   unsent.reserve(2048);
-  int purged = 0, resent = 0;
+  int purged = 0, resent = 0, kept = 0;
 
   while (r.available()){
     String line = r.readStringUntil('\n');
@@ -589,6 +625,7 @@ int drainPending(){
 
     // Proven delivered — the broker echoed this exact payload back to us.
     if (isConfirmed(payloadHashStr(line))) { purged++; continue; }
+    kept++;
 
     // Not proven. (Re)publish and KEEP the line regardless of what publish()
     // claims: its return value only means "handed to the socket". The line
@@ -620,8 +657,10 @@ int drainPending(){
     }
   }
 
+  pendingCount = kept;        // authoritative: what we just rewrote to disk
+
   if (purged || resent){
-    Serial.printf("drainPending: purged=%d resent=%d\n", purged, resent);
+    Serial.printf("drainPending: purged=%d resent=%d queued=%d\n", purged, resent, kept);
   }
   return purged;
 }
@@ -866,6 +905,10 @@ void setup(){
 
   // SD
   initSD();
+
+  // Seed the outbox depth from disk so the header is honest from the first
+  // frame — a backlog survives a reboot and should still be visible.
+  pendingCount = countPendingLines();
 
   // Load per-device config from SD (overrides defaults)
   loadConfigFromSD();
